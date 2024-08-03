@@ -18,16 +18,5 @@
 // LLD 14.0.0 (https://github.com/llvm/llvm-project.git
 // 2d9759c7902c5cbc9a7e3ab623321d5578d51687)
 std::string lld::getLLDVersion() {
-#ifdef LLD_VENDOR
-#define LLD_VENDOR_DISPLAY LLD_VENDOR " "
-#else
-#define LLD_VENDOR_DISPLAY
-#endif
-#if defined(LLVM_REPOSITORY) && defined(LLVM_REVISION)
-  return LLD_VENDOR_DISPLAY "LLD " LLD_VERSION_STRING " (" LLVM_REPOSITORY
-                            " " LLVM_REVISION ")";
-#else
-  return LLD_VENDOR_DISPLAY "LLD " LLD_VERSION_STRING;
-#endif
-#undef LLD_VENDOR_DISPLAY
+return "LLD " LLD_VERSION_STRING;
 }
