@@ -893,8 +893,8 @@ public:
   }
   bool hasCode() const { return Code != nullptr; }
 
-  static std::string signedHexLiteral(const llvm::APInt &iOrig) {
-    llvm::APInt i = iOrig.trunc(64);
+  static std::string signedHexLiteral(const APInt &iOrig) {
+    APInt i = iOrig.trunc(64);
     SmallString<40> s;
     i.toString(s, 16, true, true);
     return std::string(s);
@@ -907,7 +907,7 @@ public:
     for (const auto &kv : ImmediateArgs) {
       const ImmediateArg &IA = kv.second;
 
-      llvm::APInt lo(128, 0), hi(128, 0);
+      APInt lo(128, 0), hi(128, 0);
       switch (IA.boundsType) {
       case ImmediateArg::BoundsType::ExplicitRange:
         lo = IA.i1;
@@ -915,7 +915,7 @@ public:
         break;
       case ImmediateArg::BoundsType::UInt:
         lo = 0;
-        hi = llvm::APInt::getMaxValue(IA.i1).zext(128);
+        hi = APInt::getMaxValue(IA.i1).zext(128);
         break;
       }
 
@@ -925,8 +925,8 @@ public:
       // immediate is smaller than the _possible_ range of values for
       // its type.
       unsigned ArgTypeBits = IA.ArgType->sizeInBits();
-      llvm::APInt ArgTypeRange = llvm::APInt::getMaxValue(ArgTypeBits).zext(128);
-      llvm::APInt ActualRange = (hi-lo).trunc(64).sext(128);
+      APInt ArgTypeRange = APInt::getMaxValue(ArgTypeBits).zext(128);
+      APInt ActualRange = (hi - lo).trunc(64).sext(128);
       if (ActualRange.ult(ArgTypeRange))
         SemaChecks.push_back("SemaRef.BuiltinConstantArgRange(TheCall, " +
                              Index + ", " + signedHexLiteral(lo) + ", " +
@@ -994,9 +994,10 @@ public:
   const VectorType *getVectorType(const ScalarType *ST, unsigned Lanes) {
     std::tuple<ScalarTypeKind, unsigned, unsigned> key(ST->kind(),
                                                        ST->sizeInBits(), Lanes);
-    if (VectorTypes.find(key) == VectorTypes.end())
-      VectorTypes[key] = std::make_unique<VectorType>(ST, Lanes);
-    return VectorTypes[key].get();
+    auto [It, Inserted] = VectorTypes.try_emplace(key);
+    if (Inserted)
+      It->second = std::make_unique<VectorType>(ST, Lanes);
+    return It->second.get();
   }
   const VectorType *getVectorType(const ScalarType *ST) {
     return getVectorType(ST, 128 / ST->sizeInBits());
@@ -1004,22 +1005,25 @@ public:
   const MultiVectorType *getMultiVectorType(unsigned Registers,
                                             const VectorType *VT) {
     std::pair<std::string, unsigned> key(VT->cNameBase(), Registers);
-    if (MultiVectorTypes.find(key) == MultiVectorTypes.end())
-      MultiVectorTypes[key] = std::make_unique<MultiVectorType>(Registers, VT);
-    return MultiVectorTypes[key].get();
+    auto [It, Inserted] = MultiVectorTypes.try_emplace(key);
+    if (Inserted)
+      It->second = std::make_unique<MultiVectorType>(Registers, VT);
+    return It->second.get();
   }
   const PredicateType *getPredicateType(unsigned Lanes) {
     unsigned key = Lanes;
-    if (PredicateTypes.find(key) == PredicateTypes.end())
-      PredicateTypes[key] = std::make_unique<PredicateType>(Lanes);
-    return PredicateTypes[key].get();
+    auto [It, Inserted] = PredicateTypes.try_emplace(key);
+    if (Inserted)
+      It->second = std::make_unique<PredicateType>(Lanes);
+    return It->second.get();
   }
   const PointerType *getPointerType(const Type *T, bool Const) {
     PointerType PT(T, Const);
     std::string key = PT.cName();
-    if (PointerTypes.find(key) == PointerTypes.end())
-      PointerTypes[key] = std::make_unique<PointerType>(PT);
-    return PointerTypes[key].get();
+    auto [It, Inserted] = PointerTypes.try_emplace(key);
+    if (Inserted)
+      It->second = std::make_unique<PointerType>(PT);
+    return It->second.get();
   }
 
   // Methods to construct a type from various pieces of Tablegen. These are
@@ -1583,7 +1587,6 @@ void EmitterBase::EmitBuiltinCG(raw_ostream &OS) {
     CodeGenParamAllocator ParamAllocPrelim{&MG.ParamTypes, &OI.ParamValues};
     raw_string_ostream OS(MG.Code);
     Int.genCode(OS, ParamAllocPrelim, 1);
-    OS.flush();
 
     MergeableGroupsPrelim[MG].insert(OI);
   }
@@ -1655,7 +1658,6 @@ void EmitterBase::EmitBuiltinCG(raw_ostream &OS) {
                                        &ParamNumbers};
       raw_string_ostream OS(MG.Code);
       Int->genCode(OS, ParamAlloc, 2);
-      OS.flush();
 
       MergeableGroups[MG].insert(OI);
     }
