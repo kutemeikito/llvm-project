@@ -16,6 +16,7 @@
 #include "AMDGPU.h"
 #include "AMDGPUGlobalISelUtils.h"
 #include "AMDGPUInstrInfo.h"
+#include "AMDGPUMemoryUtils.h"
 #include "AMDGPUTargetMachine.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "SIInstrInfo.h"
@@ -23,7 +24,6 @@
 #include "SIRegisterInfo.h"
 #include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/ADT/ScopeExit.h"
-#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/CodeGen/GlobalISel/GenericMachineInstrs.h"
 #include "llvm/CodeGen/GlobalISel/LegalizerHelper.h"
 #include "llvm/CodeGen/GlobalISel/MIPatternMatch.h"
@@ -2975,7 +2975,8 @@ bool AMDGPULegalizerInfo::legalizeGlobalValue(
 
   if (AS == AMDGPUAS::LOCAL_ADDRESS || AS == AMDGPUAS::REGION_ADDRESS) {
     if (!MFI->isModuleEntryFunction() &&
-        GV->getName() != "llvm.amdgcn.module.lds") {
+        GV->getName() != "llvm.amdgcn.module.lds" &&
+        !AMDGPU::isNamedBarrier(*cast<GlobalVariable>(GV))) {
       const Function &Fn = MF.getFunction();
       DiagnosticInfoUnsupported BadLDSDecl(
         Fn, "local memory global used by non-kernel function", MI.getDebugLoc(),
@@ -4902,16 +4903,40 @@ bool AMDGPULegalizerInfo::legalizeFDIV16(MachineInstr &MI,
   LLT S16 = LLT::scalar(16);
   LLT S32 = LLT::scalar(32);
 
+  // a32.u = opx(V_CVT_F32_F16, a.u); // CVT to F32
+  // b32.u = opx(V_CVT_F32_F16, b.u); // CVT to F32
+  // r32.u = opx(V_RCP_F32, b32.u); // rcp = 1 / d
+  // q32.u = opx(V_MUL_F32, a32.u, r32.u); // q = n * rcp
+  // e32.u = opx(V_MAD_F32, (b32.u^_neg32), q32.u, a32.u); // err = -d * q + n
+  // q32.u = opx(V_MAD_F32, e32.u, r32.u, q32.u); // q = n * rcp
+  // e32.u = opx(V_MAD_F32, (b32.u^_neg32), q32.u, a32.u); // err = -d * q + n
+  // tmp.u = opx(V_MUL_F32, e32.u, r32.u);
+  // tmp.u = opx(V_AND_B32, tmp.u, 0xff800000)
+  // q32.u = opx(V_ADD_F32, tmp.u, q32.u);
+  // q16.u = opx(V_CVT_F16_F32, q32.u);
+  // q16.u = opx(V_DIV_FIXUP_F16, q16.u, b.u, a.u); // q = touchup(q, d, n)
+
   auto LHSExt = B.buildFPExt(S32, LHS, Flags);
   auto RHSExt = B.buildFPExt(S32, RHS, Flags);
-
-  auto RCP = B.buildIntrinsic(Intrinsic::amdgcn_rcp, {S32})
+  auto NegRHSExt = B.buildFNeg(S32, RHSExt);
+  auto Rcp = B.buildIntrinsic(Intrinsic::amdgcn_rcp, {S32})
                  .addUse(RHSExt.getReg(0))
                  .setMIFlags(Flags);
-
-  auto QUOT = B.buildFMul(S32, LHSExt, RCP, Flags);
-  auto RDst = B.buildFPTrunc(S16, QUOT, Flags);
-
+  auto Quot = B.buildFMul(S32, LHSExt, Rcp, Flags);
+  MachineInstrBuilder Err;
+  if (ST.hasMadMacF32Insts()) {
+    Err = B.buildFMAD(S32, NegRHSExt, Quot, LHSExt, Flags);
+    Quot = B.buildFMAD(S32, Err, Rcp, Quot, Flags);
+    Err = B.buildFMAD(S32, NegRHSExt, Quot, LHSExt, Flags);
+  } else {
+    Err = B.buildFMA(S32, NegRHSExt, Quot, LHSExt, Flags);
+    Quot = B.buildFMA(S32, Err, Rcp, Quot, Flags);
+    Err = B.buildFMA(S32, NegRHSExt, Quot, LHSExt, Flags);
+  }
+  auto Tmp = B.buildFMul(S32, Err, Rcp, Flags);
+  Tmp = B.buildAnd(S32, Tmp, B.buildConstant(S32, 0xff800000));
+  Quot = B.buildFAdd(S32, Tmp, Quot, Flags);
+  auto RDst = B.buildFPTrunc(S16, Quot, Flags);
   B.buildIntrinsic(Intrinsic::amdgcn_div_fixup, Res)
       .addUse(RDst.getReg(0))
       .addUse(RHS)
@@ -5469,6 +5494,15 @@ bool AMDGPULegalizerInfo::legalizeLaneOp(LegalizerHelper &Helper,
           .addImm(Src5)
           .getReg(0);
     }
+    case Intrinsic::amdgcn_mov_dpp8:
+      return LaneOp.addImm(MI.getOperand(3).getImm()).getReg(0);
+    case Intrinsic::amdgcn_update_dpp:
+      return LaneOp.addUse(Src1)
+          .addImm(MI.getOperand(4).getImm())
+          .addImm(MI.getOperand(5).getImm())
+          .addImm(MI.getOperand(6).getImm())
+          .addImm(MI.getOperand(7).getImm())
+          .getReg(0);
     default:
       llvm_unreachable("unhandled lane op");
     }
@@ -5478,7 +5512,7 @@ bool AMDGPULegalizerInfo::legalizeLaneOp(LegalizerHelper &Helper,
   Register Src0 = MI.getOperand(2).getReg();
   Register Src1, Src2;
   if (IID == Intrinsic::amdgcn_readlane || IID == Intrinsic::amdgcn_writelane ||
-      IsSetInactive || IsPermLane16) {
+      IID == Intrinsic::amdgcn_update_dpp || IsSetInactive || IsPermLane16) {
     Src1 = MI.getOperand(3).getReg();
     if (IID == Intrinsic::amdgcn_writelane || IsPermLane16) {
       Src2 = MI.getOperand(4).getReg();
@@ -5488,7 +5522,13 @@ bool AMDGPULegalizerInfo::legalizeLaneOp(LegalizerHelper &Helper,
   LLT Ty = MRI.getType(DstReg);
   unsigned Size = Ty.getSizeInBits();
 
-  if (Size == 32) {
+  unsigned SplitSize = 32;
+  if (IID == Intrinsic::amdgcn_update_dpp && (Size % 64 == 0) &&
+      ST.hasDPALU_DPP() &&
+      AMDGPU::isLegalDPALU_DPPControl(MI.getOperand(4).getImm()))
+    SplitSize = 64;
+
+  if (Size == SplitSize) {
     // Already legal
     return true;
   }
@@ -5496,7 +5536,7 @@ bool AMDGPULegalizerInfo::legalizeLaneOp(LegalizerHelper &Helper,
   if (Size < 32) {
     Src0 = B.buildAnyExt(S32, Src0).getReg(0);
 
-    if (IsSetInactive || IsPermLane16)
+    if (IID == Intrinsic::amdgcn_update_dpp || IsSetInactive || IsPermLane16)
       Src1 = B.buildAnyExt(LLT::scalar(32), Src1).getReg(0);
 
     if (IID == Intrinsic::amdgcn_writelane)
@@ -5508,31 +5548,28 @@ bool AMDGPULegalizerInfo::legalizeLaneOp(LegalizerHelper &Helper,
     return true;
   }
 
-  if (Size % 32 != 0)
+  if (Size % SplitSize != 0)
     return false;
 
-  LLT PartialResTy = S32;
+  LLT PartialResTy = LLT::scalar(SplitSize);
   if (Ty.isVector()) {
     LLT EltTy = Ty.getElementType();
-    switch (EltTy.getSizeInBits()) {
-    case 16:
-      PartialResTy = Ty.changeElementCount(ElementCount::getFixed(2));
-      break;
-    case 32:
+    unsigned EltSize = EltTy.getSizeInBits();
+    if (EltSize == SplitSize) {
       PartialResTy = EltTy;
-      break;
-    default:
-      // Handle all other cases via S32 pieces;
-      break;
+    } else if (EltSize == 16 || EltSize == 32) {
+      unsigned NElem = SplitSize / EltSize;
+      PartialResTy = Ty.changeElementCount(ElementCount::getFixed(NElem));
     }
+    // Handle all other cases via S32/S64 pieces;
   }
 
-  SmallVector<Register, 2> PartialRes;
-  unsigned NumParts = Size / 32;
+  SmallVector<Register, 4> PartialRes;
+  unsigned NumParts = Size / SplitSize;
   MachineInstrBuilder Src0Parts = B.buildUnmerge(PartialResTy, Src0);
   MachineInstrBuilder Src1Parts, Src2Parts;
 
-  if (IsSetInactive || IsPermLane16)
+  if (IID == Intrinsic::amdgcn_update_dpp || IsSetInactive || IsPermLane16)
     Src1Parts = B.buildUnmerge(PartialResTy, Src1);
 
   if (IID == Intrinsic::amdgcn_writelane)
@@ -5541,7 +5578,7 @@ bool AMDGPULegalizerInfo::legalizeLaneOp(LegalizerHelper &Helper,
   for (unsigned i = 0; i < NumParts; ++i) {
     Src0 = Src0Parts.getReg(i);
 
-    if (IsSetInactive || IsPermLane16)
+    if (IID == Intrinsic::amdgcn_update_dpp || IsSetInactive || IsPermLane16)
       Src1 = Src1Parts.getReg(i);
 
     if (IID == Intrinsic::amdgcn_writelane)
@@ -7528,6 +7565,8 @@ bool AMDGPULegalizerInfo::legalizeIntrinsic(LegalizerHelper &Helper,
   case Intrinsic::amdgcn_permlane64:
   case Intrinsic::amdgcn_set_inactive:
   case Intrinsic::amdgcn_set_inactive_chain_arg:
+  case Intrinsic::amdgcn_mov_dpp8:
+  case Intrinsic::amdgcn_update_dpp:
     return legalizeLaneOp(Helper, MI, IntrID);
   case Intrinsic::amdgcn_s_buffer_prefetch_data:
     return legalizeSBufferPrefetch(Helper, MI);
