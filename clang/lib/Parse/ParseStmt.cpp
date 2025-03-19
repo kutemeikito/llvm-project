@@ -799,7 +799,7 @@ StmtResult Parser::ParseLabeledStatement(ParsedAttributes &Attrs,
   }
 
   // If we've not parsed a statement yet, parse one now.
-  if (!SubStmt.isInvalid() && !SubStmt.isUsable())
+  if (SubStmt.isUnset())
     SubStmt = ParseStatement(nullptr, StmtCtx);
 
   // Broken substmt shouldn't prevent the label from being added to the AST.
@@ -1552,6 +1552,11 @@ StmtResult Parser::ParseIfStatement(SourceLocation *TrailingElseLoc) {
                                           : diag::ext_consteval_if);
       IsConsteval = true;
       ConstevalLoc = ConsumeToken();
+    } else if (Tok.is(tok::code_completion)) {
+      cutOffParsing();
+      Actions.CodeCompletion().CodeCompleteKeywordAfterIf(
+          NotLocation.isValid());
+      return StmtError();
     }
   }
   if (!IsConsteval && (NotLocation.isValid() || Tok.isNot(tok::l_paren))) {

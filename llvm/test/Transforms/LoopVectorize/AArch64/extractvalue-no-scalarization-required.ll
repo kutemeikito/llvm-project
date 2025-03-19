@@ -23,9 +23,9 @@
 ; Check that the extractvalue operands are actually free in vector code.
 
 ; FORCED:         [[E1:%.+]] = extractvalue { i64, i64 } %sv, 0
-; FORCED-NEXT:    [[E2:%.+]] = extractvalue { i64, i64 } %sv, 1
 ; FORCED-NEXT:    %broadcast.splatinsert = insertelement <2 x i64> poison, i64 [[E1]], i64 0
 ; FORCED-NEXT:    %broadcast.splat = shufflevector <2 x i64> %broadcast.splatinsert, <2 x i64> poison, <2 x i32> zeroinitializer
+; FORCED-NEXT:    [[E2:%.+]] = extractvalue { i64, i64 } %sv, 1
 ; FORCED-NEXT:    %broadcast.splatinsert1 = insertelement <2 x i64> poison, i64 [[E2]], i64 0
 ; FORCED-NEXT:    %broadcast.splat2 = shufflevector <2 x i64> %broadcast.splatinsert1, <2 x i64> poison, <2 x i32> zeroinitializer
 ; FORCED-NEXT:    [[ADD:%.+]] = add <2 x i64> %broadcast.splat, %broadcast.splat2
@@ -63,11 +63,11 @@ exit:
 ; Similar to the test case above, but checks getVectorCallCost as well.
 declare float @powf(float, float) readnone nounwind
 
-; Ensure the extractvalue + add instructions are hoisted out
+; Ensure the extractvalue instructions are hoisted out
+; CM-LABEL: Checking a loop in 'test_getVectorCallCost'
 ; CM: vector.ph:
 ; CM:  CLONE ir<%a> = extractvalue ir<%sv>
 ; CM:  CLONE ir<%b> = extractvalue ir<%sv>
-; CM:  WIDEN ir<%add> = add ir<%a>, ir<%b>
 ; CM:  Successor(s): vector loop
 
 ; CM: LV: Scalar loop costs: 14.
@@ -75,9 +75,9 @@ declare float @powf(float, float) readnone nounwind
 ; FORCED-LABEL: define void @test_getVectorCallCost
 
 ; FORCED:         [[E1:%.+]] = extractvalue { float, float } %sv, 0
-; FORCED-NEXT:    [[E2:%.+]] = extractvalue { float, float } %sv, 1
 ; FORCED-NEXT:    %broadcast.splatinsert = insertelement <2 x float> poison, float [[E1]], i64 0
 ; FORCED-NEXT:    %broadcast.splat = shufflevector <2 x float> %broadcast.splatinsert, <2 x float> poison, <2 x i32> zeroinitializer
+; FORCED-NEXT:    [[E2:%.+]] = extractvalue { float, float } %sv, 1
 ; FORCED-NEXT:    %broadcast.splatinsert1 = insertelement <2 x float> poison, float [[E2]], i64 0
 ; FORCED-NEXT:    %broadcast.splat2 = shufflevector <2 x float> %broadcast.splatinsert1, <2 x float> poison, <2 x i32> zeroinitializer
 
